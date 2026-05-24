@@ -48,13 +48,9 @@ namespace black_internal::solver {
     public:
       friend class model;
 
-      // Checks if the formula `f` has a syntax supported by the solver
-      //
-      // Calls the callback function `err` with a description of the error
-      static bool 
+      static bool
       check_syntax(formula f, std::function<void(std::string)> const& err);
 
-      // Constructor and destructor
       solver();
       ~solver();
 
@@ -63,17 +59,6 @@ namespace black_internal::solver {
       solver(solver &&);
       solver &operator=(solver &&);
 
-      // Solve the formula `f` over the scope `xi`, with up to `k_max'
-      // iterations returning `tribool::undef` if `k_max` is reached
-      //
-      // If `semi_decision` is true, the termination rules for unsatisfiable
-      // formulas are disabled, speeding up solving of satisfiable ones.
-      //
-      // If `finite` is `true` the formula is solved for the finite-trace
-      // semantics.
-      //
-      // WARNING: `semi_decision = false` with first-order formulas using
-      //          next(x) terms results in an *incomplete* algorithm.
       tribool solve(
         scope const& xi,
         formula f,
@@ -82,10 +67,18 @@ namespace black_internal::solver {
         std::optional<std::chrono::seconds> timeout = {},
         bool semi_decision = false
       );
-      
-      //
-      // Same as `solve` but for validity. The arguments are the same.
-      //
+
+      // Parallel version of solve(). num_threads controls parallelism.
+      tribool solve_parallel(
+        scope const& xi,
+        formula f,
+        bool finite = false,
+        size_t k_max = std::numeric_limits<size_t>::max(),
+        std::optional<std::chrono::seconds> timeout = {},
+        bool semi_decision = false,
+        size_t num_threads = 4
+      );
+
       tribool is_valid(
         scope const& xi,
         formula f,
@@ -95,25 +88,16 @@ namespace black_internal::solver {
         bool semi_decision = false
       );
 
-      // interrupts the execution of the current solve() or is_valid() 
-      // calls, which will return tribool::undef
       void interrupt();
 
-      // Returns the model of the formula, if the last call to solve() 
-      // returned true
       std::optional<class model> model() const;
 
-      // Returns the last bound tried by the algorithm. The value returned 
-      // does not make sense before the first call to solve()
       size_t last_bound() const;
 
-      // Choose the SAT backend. The backend must exist.
       void set_sat_backend(std::string name);
 
-      // Retrieve the current SAT backend
       std::string sat_backend() const;
 
-      // Data type sent to the debug trace routine
       struct trace_t {
         enum type_t {
           stage,
@@ -129,14 +113,13 @@ namespace black_internal::solver {
         std::variant<size_t, logic::formula> data;
       };
 
-      // set the debug trace callback
       void set_tracer(std::function<void(trace_t)> const&tracer);
 
     private:
       struct _solver_t;
       std::shared_ptr<_solver_t> _data;
 
-  }; // end class Black Solver
+  }; // end class solver
 
   class BLACK_EXPORT model
   {
@@ -150,16 +133,16 @@ namespace black_internal::solver {
     private:
       friend class solver;
       model(solver const&s) : _solver{s} { }
-      
+
       solver const&_solver;
   };
 
 } // end namespace black_internal
 
-// Names exported to the user
 namespace black {
   using black_internal::solver::solver;
   using black_internal::solver::model;
 }
 
 #endif // SOLVER_HPP
+
