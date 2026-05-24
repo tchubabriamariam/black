@@ -763,3 +763,12 @@ namespace black_internal::encoder
     });
   }
 }
+
+
+// running
+// black solve -m -f 'F(G(F(p)))'
+// black solve -m -f 'F(p)'
+// black solve -m -f 'F(p)'
+// black solve -f 'G(!p) & (q U p)'
+// black solve -f 'G(!p) & G(!q) & (p U q) & (q U p)'
+// black solve -m -f 'G(F(p))'
