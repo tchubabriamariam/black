@@ -58,7 +58,8 @@ target_link_libraries(euflia PRIVATE black fmt::fmt)
 add_executable(rts
         formulas_generators/ltlfmt/rts.cpp)
 target_link_libraries(rts PRIVATE black fmt::fmt)
-
+add_executable(benchmark_parallel benchmark_parallel.cpp)
+target_link_libraries(benchmark_parallel black)
 set_target_properties(
   crscounter_generator random_formulas_generator ltlfmt lia lra euf euflia rts
   PROPERTIES 
@@ -89,7 +90,9 @@ if(Catch2_FOUND)
     set(CATCH_TARGET Catch2::Catch2WithMain)
   else()
     set(CATCH_TARGET Catch2::Catch2)
-    set(UNIT_TESTS ${UNIT_TESTS} units/main.cpp)
+    set(UNIT_TESTS ${UNIT_TESTS} units/main.cpp
+            benchmark_parallel.cpp
+    )
   endif()
 
   add_executable(unit_tests ${UNIT_TESTS})
