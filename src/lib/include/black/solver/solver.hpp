@@ -69,6 +69,10 @@ namespace black_internal::solver {
       );
 
       // Parallel version of solve(). num_threads controls parallelism.
+      //
+      // Naive variant: every worker owns its own encoder and re-builds the
+      // k-unraveling / prune formulas from scratch. Kept for benchmarking
+      // against solve_parallel_shared().
       tribool solve_parallel(
         scope const& xi,
         formula f,
@@ -78,6 +82,66 @@ namespace black_internal::solver {
         bool semi_decision = false,
         size_t num_threads = 4
       );
+
+      // Parallel version with a shared, read-only encoding. A single encoder
+      // owns all mutations of the alphabet and builds each k-indexed formula
+      // exactly once (under a lock); worker threads only READ those immutable
+      // formulas to feed their own independent SAT solvers. This removes both
+      // the redundant re-encoding and the data race on the shared alphabet
+      // that solve_parallel() has.
+      //
+      // If pin_performance_cores is true, worker threads request a high QoS
+      // class so the OS schedules them on performance ("P") cores rather than
+      // efficiency ("E") cores (relevant on Apple silicon / big.LITTLE).
+      tribool solve_parallel_shared(
+        scope const& xi,
+        formula f,
+        bool finite = false,
+        size_t k_max = std::numeric_limits<size_t>::max(),
+        std::optional<std::chrono::seconds> timeout = {},
+        bool semi_decision = false,
+        size_t num_threads = 4,
+        bool pin_performance_cores = false
+      );
+
+      // Result of analyze_parallelism(): a hardware-independent estimate of how
+      // much a naive branch-parallelisation of solve() can help, derived from a
+      // single instrumented sequential run (no extra cores required).
+      struct parallelism_report {
+        tribool result = tribool::undef;
+        // k at which the sequential algorithm reached a definitive answer (K*).
+        size_t decisive_k = 0;
+        // Sum over k=0..K* of (encode+assert time + SAT-check time). This is
+        // what the sequential algorithm pays.
+        double seq_total_ms = 0.0;
+        // Critical path under an idealised speculative scheme with unbounded
+        // cores: one solver per k built from scratch, all running at once. The
+        // deciding solver must build the whole spine of unravelings 0..K* and
+        // then perform its own check at K*; every other check overlaps.
+        //   ideal = sum(assert_ms[0..K*]) + check_ms[K*]
+        double ideal_parallel_ms = 0.0;
+        // seq_total_ms / ideal_parallel_ms: upper bound on achievable speedup.
+        double speedup_upper_bound = 0.0;
+        // Per-k breakdown (indices 0..K*).
+        std::vector<double> assert_ms;
+        std::vector<double> check_ms;
+      };
+
+      // Runs solve() single-threaded while timing each k, then computes the
+      // theoretical parallelism available (see parallelism_report). Hardware
+      // independent: it measures the shape of the computation, not the machine.
+      parallelism_report analyze_parallelism(
+        scope const& xi,
+        formula f,
+        bool finite = false,
+        size_t k_max = std::numeric_limits<size_t>::max(),
+        bool semi_decision = false
+      );
+
+      // Number of performance ("P") cores available. On Apple silicon this
+      // queries hw.perflevel0.logicalcpu; elsewhere it falls back to
+      // std::thread::hardware_concurrency().
+      static size_t performance_core_count();
 
       tribool is_valid(
         scope const& xi,
