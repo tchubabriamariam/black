@@ -60,6 +60,8 @@ add_executable(rts
 target_link_libraries(rts PRIVATE black fmt::fmt)
 add_executable(benchmark_parallel benchmark_parallel.cpp)
 target_link_libraries(benchmark_parallel black)
+add_executable(parallel_study parallel_study.cpp)
+target_link_libraries(parallel_study black)
 set_target_properties(
   crscounter_generator random_formulas_generator ltlfmt lia lra euf euflia rts
   PROPERTIES 
