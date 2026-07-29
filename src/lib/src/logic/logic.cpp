@@ -25,6 +25,7 @@
 
 #include <tsl/hopscotch_map.h>
 
+#include <mutex>
 #include <variant>
 #include <vector>
 
@@ -104,17 +105,35 @@ namespace black_internal::logic {
   #define declare_storage_kind(Base, Storage) \
     , storage_allocator<storage_type::Storage>
   #include <black/internal/logic/hierarchy.hpp>
-  { 
+  {
     #define declare_storage_kind(Base, Storage) \
       using storage_allocator<storage_type::Storage>::allocate;
     #include <black/internal/logic/hierarchy.hpp>
+
+    //
+    // Stage 1 of parallelizing BLACK (naive locking): the alphabet was
+    // originally single-threaded, so `allocate()` does an unsynchronised
+    // find-then-insert into the per-kind `_store`/`_map`. When several worker
+    // threads intern nodes into the same alphabet at once (e.g. k-level
+    // parallel solving), that is a data race. This single mutex serialises all
+    // uniquing across every storage kind. It is deliberately coarse and slow:
+    // it just makes concurrent uniquing correct. A later stage replaces it with
+    // a concurrent hash table selectable at compile time so that sequential use
+    // pays nothing.
+    //
+    std::mutex _mutex;
   };
 
   //
   // Out-of-line definitions of constructors and assignments of `alphabet_base`,
   // declared in `generation.hpp`
   //
-  alphabet_base::alphabet_base() : _impl{nullptr} { }
+  // The pimpl is created eagerly (rather than lazily in `impl()`) so that the
+  // `if(!_impl)` check below cannot race: with several threads interning nodes
+  // into a shared alphabet, a lazy first-touch would otherwise let two threads
+  // both construct the impl. Construction is cheap (empty stores/maps), so
+  // doing it up front costs nothing meaningful for sequential use.
+  alphabet_base::alphabet_base() : _impl{std::make_unique<alphabet_impl>()} { }
   alphabet_base::alphabet_base(alphabet_base &&) = default;
   alphabet_base &alphabet_base::operator=(alphabet_base &&) = default;
   alphabet_base::~alphabet_base() = default;
@@ -136,9 +155,12 @@ namespace black_internal::logic {
     alphabet_base::unique( \
       storage_node<storage_type::Storage> node \
     ) { \
-      return impl()->allocate(std::move(node)); \
+      alphabet_impl *pimpl = impl(); \
+      std::lock_guard<std::mutex> lock(pimpl->_mutex); \
+      return pimpl->allocate(std::move(node)); \
     }
 
   #include <black/internal/logic/hierarchy.hpp>
 
 }
+

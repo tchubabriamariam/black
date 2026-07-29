@@ -104,6 +104,21 @@ namespace black_internal::solver {
         bool pin_performance_cores = false
       );
 
+      // Instrumentation recorded by the most recent solve_parallel() call, for
+      // the software-threads study: how the software threads behaved and how
+      // much redundant work they performed relative to what was actually needed.
+      struct parallel_counters {
+        size_t requested_threads    = 0; // threads asked for
+        size_t launched_threads     = 0; // threads that actually started running
+        size_t aborted_threads      = 0; // threads that gave up after another decided
+        size_t unravelings_needed   = 0; // k-unravelings on the path to the answer (0..K*)
+        size_t unravelings_computed = 0; // k-unravelings actually built across all threads
+        double redundancy           = 0.0; // computed / needed
+      };
+
+      // Counters from the last solve_parallel() call.
+      parallel_counters last_parallel_counters() const;
+
       // Result of analyze_parallelism(): a hardware-independent estimate of how
       // much a naive branch-parallelisation of solve() can help, derived from a
       // single instrumented sequential run (no extra cores required).

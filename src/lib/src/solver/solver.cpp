@@ -37,6 +37,8 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <cstdlib>
+#include <cstdio>
 
 #if defined(__APPLE__)
   #include <pthread/qos.h>
@@ -59,6 +61,7 @@ namespace black_internal::solver
     std::string sat_backend = BLACK_DEFAULT_BACKEND;
     std::atomic<bool> interrupt_flag = false;
     std::function<void(trace_t)> tracer = [](trace_t){};
+    solver::parallel_counters last_counters;
 
     void trace(size_t k);
     void trace(trace_t::type_t, scope const&, logic::formula);
@@ -149,6 +152,10 @@ namespace black_internal::solver
   }
 
   size_t solver::last_bound() const { return _data->last_bound; }
+
+  solver::parallel_counters solver::last_parallel_counters() const {
+    return _data->last_counters;
+  }
 
   void solver::set_sat_backend(std::string name) {
     _data->sat_backend = std::move(name);
@@ -297,6 +304,20 @@ namespace black_internal::solver
     std::atomic<int> shared_result{-1};
     std::atomic<size_t> shared_last_bound{0};
 
+    // --- Instrumentation counters (software-threads study) -------------------
+    // cnt_threads_launched   : how many worker (software) threads actually began
+    //                          running (vs how many we asked for).
+    // cnt_unravelings_computed: total number of k-unravelings computed across ALL
+    //                          threads. Compared afterwards against the number
+    //                          NEEDED on the path to the answer (k = 0..K*), this
+    //                          exposes how much redundant/speculative work the
+    //                          naive per-thread encoding does.
+    // cnt_threads_aborted    : threads that, while working, noticed another thread
+    //                          had already decided and gave up ("got stuck"/wasted).
+    std::atomic<size_t> cnt_threads_launched{0};
+    std::atomic<size_t> cnt_unravelings_computed{0};
+    std::atomic<size_t> cnt_threads_aborted{0};
+
     std::mutex winner_mutex;
     std::optional<encoder::encoder> winning_enc;
     std::unique_ptr<black::sat::solver> winning_sat;
@@ -314,14 +335,25 @@ namespace black_internal::solver
     // then does the full check on its assigned k.
 
     auto worker = [&](size_t tid) {
+      cnt_threads_launched.fetch_add(1, std::memory_order_relaxed);
       scope xi = chain(s);
       encoder::encoder local_enc{f, xi, finite};
       auto local_sat = black::sat::solver::get_solver(sat_backend, xi);
 
+      // Every k-unraveling this thread actually computes is counted here, so we
+      // can later compare the total against the number truly needed (0..K*).
+      auto unravel = [&](size_t kk) {
+        cnt_unravelings_computed.fetch_add(1, std::memory_order_relaxed);
+        return local_enc.k_unraveling(kk);
+      };
+
       // Fill in k = 0 .. tid-1 (catch-up, no SAT checks)
       for(size_t k = 0; k < tid; ++k) {
-        if(shared_result.load() != -1 || interrupt_flag) return;
-        local_sat->assert_formula(local_enc.k_unraveling(k));
+        if(shared_result.load() != -1 || interrupt_flag) {
+          cnt_threads_aborted.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        local_sat->assert_formula(unravel(k));
         if(!semi_decision)
           local_sat->assert_formula(!local_enc.prune(k));
       }
@@ -338,8 +370,11 @@ namespace black_internal::solver
           size_t gap_start = k - num_threads + 1;
           size_t gap_end   = k; // exclusive — we handle k ourselves below
           for(size_t j = gap_start; j < gap_end; ++j) {
-            if(shared_result.load() != -1 || interrupt_flag) return;
-            local_sat->assert_formula(local_enc.k_unraveling(j));
+            if(shared_result.load() != -1 || interrupt_flag) {
+              cnt_threads_aborted.fetch_add(1, std::memory_order_relaxed);
+              return;
+            }
+            local_sat->assert_formula(unravel(j));
             if(!semi_decision)
               local_sat->assert_formula(!local_enc.prune(j));
           }
@@ -351,7 +386,7 @@ namespace black_internal::solver
         // Full check for our assigned k
 
         // 1. Assert k-unraveling and check satisfiability
-        local_sat->assert_formula(local_enc.k_unraveling(k));
+        local_sat->assert_formula(unravel(k));
 
         // Update shared last_bound (best-effort)
         size_t prev = shared_last_bound.load();
@@ -406,6 +441,31 @@ namespace black_internal::solver
 
     interrupt_flag = false;
     last_bound = shared_last_bound.load();
+
+    // Record the instrumentation counters. `needed` is the number of
+    // k-unravelings on the path to the answer (k = 0..K*); `computed` is the
+    // total actually performed across all threads. Their ratio is the redundant
+    // work factor the naive per-thread encoding pays.
+    {
+      size_t needed   = last_bound + 1;
+      size_t computed = cnt_unravelings_computed.load();
+      last_counters = solver::parallel_counters{
+        num_threads,
+        cnt_threads_launched.load(),
+        cnt_threads_aborted.load(),
+        needed,
+        computed,
+        needed ? double(computed) / double(needed) : 0.0
+      };
+
+      if(std::getenv("BLACK_PARALLEL_COUNTERS"))
+        std::fprintf(stderr,
+          "[counters] requested_threads=%zu launched=%zu aborted=%zu | "
+          "unravelings needed(0..K*)=%zu computed=%zu redundancy=%.2fx | K*~%zu\n",
+          num_threads, last_counters.launched_threads,
+          last_counters.aborted_threads, needed, computed,
+          last_counters.redundancy, last_bound);
+    }
 
     int result = shared_result.load();
 

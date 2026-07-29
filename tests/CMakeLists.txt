@@ -62,6 +62,8 @@ add_executable(benchmark_parallel benchmark_parallel.cpp)
 target_link_libraries(benchmark_parallel black)
 add_executable(parallel_study parallel_study.cpp)
 target_link_libraries(parallel_study black)
+add_executable(software_threads_study software_threads_study.cpp)
+target_link_libraries(software_threads_study black)
 set_target_properties(
   crscounter_generator random_formulas_generator ltlfmt lia lra euf euflia rts
   PROPERTIES 
