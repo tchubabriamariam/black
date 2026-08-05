@@ -110,7 +110,8 @@ namespace black_internal::solver {
       struct parallel_counters {
         size_t requested_threads    = 0; // threads asked for
         size_t launched_threads     = 0; // threads that actually started running
-        size_t aborted_threads      = 0; // threads that gave up after another decided
+        size_t aborted_threads      = 0; // "stuck" sense 1: gave up after another decided
+        size_t lock_waits           = 0; // "stuck" sense 2: had to wait for the shared lock
         size_t unravelings_needed   = 0; // k-unravelings on the path to the answer (0..K*)
         size_t unravelings_computed = 0; // k-unravelings actually built across all threads
         double redundancy           = 0.0; // computed / needed

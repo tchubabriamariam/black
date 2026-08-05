@@ -25,6 +25,7 @@
 
 #include <tsl/hopscotch_map.h>
 
+#include <atomic>
 #include <mutex>
 #include <variant>
 #include <vector>
@@ -122,6 +123,12 @@ namespace black_internal::logic {
     // pays nothing.
     //
     std::mutex _mutex;
+
+    // Counts how many times a thread found `_mutex` already held and had to
+    // wait for it (lock contention). This is the "threads blocked on the lock"
+    // measure for the software-threads study. Incremented only on a failed
+    // try_lock, so uncontended (sequential) use adds no work.
+    std::atomic<size_t> _lock_contended{0};
   };
 
   //
@@ -156,11 +163,22 @@ namespace black_internal::logic {
       storage_node<storage_type::Storage> node \
     ) { \
       alphabet_impl *pimpl = impl(); \
-      std::lock_guard<std::mutex> lock(pimpl->_mutex); \
+      if(!pimpl->_mutex.try_lock()) { \
+        pimpl->_lock_contended.fetch_add(1, std::memory_order_relaxed); \
+        pimpl->_mutex.lock(); \
+      } \
+      std::lock_guard<std::mutex> lock(pimpl->_mutex, std::adopt_lock); \
       return pimpl->allocate(std::move(node)); \
     }
 
   #include <black/internal/logic/hierarchy.hpp>
+
+  // Total number of times a thread had to wait for the uniquing lock over this
+  // alphabet's lifetime. solve_parallel() snapshots this before/after a run to
+  // report the per-solve lock contention. Returns 0 if the impl is not built.
+  size_t alphabet_base::lock_contention_count() const {
+    return _impl ? _impl->_lock_contended.load(std::memory_order_relaxed) : 0;
+  }
 
 }
 

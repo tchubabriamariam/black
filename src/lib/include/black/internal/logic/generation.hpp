@@ -651,6 +651,11 @@ namespace black_internal::logic
 
     #include <black/internal/logic/hierarchy.hpp>
 
+    // Instrumentation for the software-threads study: how many times a thread
+    // had to wait for the node-uniquing lock (lock contention) over this
+    // alphabet's lifetime.
+    size_t lock_contention_count() const;
+
     template<storage_type, typename, typename>
     friend class storage_ctor_base;
     

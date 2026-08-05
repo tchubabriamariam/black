@@ -430,6 +430,10 @@ namespace black_internal::solver
       }
     }; // end worker lambda
 
+    // Snapshot the alphabet's lock-contention count so we can report how many
+    // times a worker had to wait for the shared uniquing lock during this run.
+    size_t lock_waits_before = sigma->lock_contention_count();
+
     // Launch all threads
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
@@ -449,10 +453,12 @@ namespace black_internal::solver
     {
       size_t needed   = last_bound + 1;
       size_t computed = cnt_unravelings_computed.load();
+      size_t lock_waits = sigma->lock_contention_count() - lock_waits_before;
       last_counters = solver::parallel_counters{
         num_threads,
         cnt_threads_launched.load(),
         cnt_threads_aborted.load(),
+        lock_waits,
         needed,
         computed,
         needed ? double(computed) / double(needed) : 0.0
@@ -460,11 +466,12 @@ namespace black_internal::solver
 
       if(std::getenv("BLACK_PARALLEL_COUNTERS"))
         std::fprintf(stderr,
-          "[counters] requested_threads=%zu launched=%zu aborted=%zu | "
-          "unravelings needed(0..K*)=%zu computed=%zu redundancy=%.2fx | K*~%zu\n",
+          "[counters] requested_threads=%zu launched=%zu | stuck: aborted=%zu "
+          "lock_waits=%zu | unravelings needed(0..K*)=%zu computed=%zu "
+          "redundancy=%.2fx | K*~%zu\n",
           num_threads, last_counters.launched_threads,
-          last_counters.aborted_threads, needed, computed,
-          last_counters.redundancy, last_bound);
+          last_counters.aborted_threads, last_counters.lock_waits,
+          needed, computed, last_counters.redundancy, last_bound);
     }
 
     int result = shared_result.load();
