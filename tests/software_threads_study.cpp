@@ -1,33 +1,31 @@
 //
-// Software-threads / oversubscription study.
+// Software-threads / oversubscription study: naive vs shared, several formulas.
 //
 // The k-level parallel solver takes a thread count. Those are SOFTWARE threads:
 // we may create far more of them than the machine has HARDWARE threads (cores),
-// and the OS scheduler multiplexes them onto the cores. This program sweeps the
-// software-thread count from 1 up past the hardware-thread count and, for each
-// setting, reports both the wall-clock time and the instrumentation counters
-// recorded by solve_parallel():
+// and the OS scheduler multiplexes them onto the cores. For each formula this
+// program sweeps the software-thread count from 1 up past the hardware-thread
+// count and runs BOTH parallel strategies at every step:
 //
-//   sw_threads       number of software threads requested for the run
-//   wall_ms          wall-clock time of the whole solve, in milliseconds
-//   speedup_vs_1     wall_ms(1 thread) / wall_ms(this run); >1 = faster than 1 thread
-//   threads_started  software threads that actually began running
-//   stuck_aborted    threads that gave up after another thread already decided (wasted)
-//   stuck_lock_waits times a thread had to wait for the shared uniquing lock
-//   unrav_needed     k-unravelings on the path to the answer (k = 0..K*)
-//   unrav_computed   k-unravelings actually built across ALL threads
-//   redundancy       unrav_computed / unrav_needed (how much extra work was done)
+//   naive   = solve_parallel()         -- every thread rebuilds the whole
+//                                          encoding itself (redundant, racy)
+//   shared  = solve_parallel_shared()  -- one encoder builds each formula once,
+//                                          workers only read it
 //
-// What to look for:
-//   * redundancy climbs roughly with the thread count (each thread rebuilds the
-//     unraveling spine) until it saturates near K*+1 -- past that, extra threads
-//     race on k values beyond the decisive one and mostly just abort.
-//   * wall time stops improving (and usually worsens) once software threads
-//     exceed hardware threads: the scheduler is time-slicing, so more threads
-//     buy context-switch overhead, not parallelism.
+// Columns (times in milliseconds):
+//   threads        number of software threads requested
+//   naive_ms       wall time of the naive solver
+//   shared_ms      wall time of the shared solver
+//   naive_vs_seq   sequential_time / naive_ms   (>1 = faster than sequential)
+//   shared_vs_seq  sequential_time / shared_ms  (>1 = faster than sequential)
+//   redundancy     naive: unravelings computed / needed (shared builds each once,
+//                  so its redundancy is ~1 by design and is not re-measured here)
+//   lock_waits     naive: times a thread waited for the shared uniquing lock
 //
-// Run `black::solver::performance_core_count()` and hardware_concurrency() are
-// printed so the oversubscription point (threads > cores) is visible.
+// Both speedups use the SAME sequential baseline, so naive and shared are
+// directly comparable. A '*' marks oversubscription (threads > hardware
+// threads); 'MISMATCH' marks a run whose parallel answer disagreed with the
+// sequential one (the naive solver has an intermittent correctness bug).
 //
 
 #include <black/solver/solver.hpp>
@@ -52,60 +50,95 @@ static formula Xn(formula f, int n) {
   return f;
 }
 
-int main(int argc, char** argv) {
-  // Hard UNSAT family X^n(p) & X^n(!p): forces the decisive bound K* = n, so
-  // there is a real unraveling spine to (re)build. n can be overridden on the
-  // command line.
-  int n = (argc > 1) ? std::atoi(argv[1]) : 20;
+static const char* show(tribool t) {
+  if(t == true)  return "SAT";
+  if(t == false) return "UNSAT";
+  return "?";
+}
 
+template<class F> static double ms_of(F&& fn) {
+  auto a = steady_clock::now();
+  fn();
+  auto b = steady_clock::now();
+  return duration<double, std::milli>(b - a).count();
+}
+
+int main() {
   alphabet sigma;
   scope xi{sigma};
   auto p = sigma.proposition("p");
-  formula f = Xn(p, n) && Xn(!p, n);
+  auto q = sigma.proposition("q");
+  auto r = sigma.proposition("r");
+
+  struct Case { std::string label; formula f; };
+  std::vector<Case> cases = {
+    // Easy (decides at k=1): no real parallelism to exploit.
+    {"G(F(p)) & G(F(q)) & G(F(r))",  G(F(p)) && G(F(q)) && G(F(r))},
+    // Hard family X^n(p) & X^n(!p): UNSAT, forces the decisive bound K*=n.
+    {"X^12(p) & X^12(!p)",           Xn(p,12) && Xn(!p,12)},
+    {"X^16(p) & X^16(!p)",           Xn(p,16) && Xn(!p,16)},
+    {"X^20(p) & X^20(!p)",           Xn(p,20) && Xn(!p,20)},
+  };
 
   size_t hw     = std::thread::hardware_concurrency();
   size_t pcores = solver::performance_core_count();
 
-  std::cout << "Formula: X^" << n << "(p) & X^" << n << "(!p)   (UNSAT, K*=" << n << ")\n";
   std::cout << "Hardware threads: " << hw
             << "   Performance cores: " << pcores << "\n";
   std::cout << "(software threads > " << hw
-            << " means the scheduler must time-slice: oversubscription)\n\n";
-
-  std::cout << std::string(122, '-') << "\n";
-  std::printf("%10s %9s %13s %15s %14s %16s %13s %15s %12s\n",
-              "sw_threads", "wall_ms", "speedup_vs_1", "threads_started",
-              "stuck_aborted", "stuck_lock_waits", "unrav_needed",
-              "unrav_computed", "redundancy");
-  std::cout << std::string(122, '-') << "\n";
+            << " => oversubscription: the scheduler must time-slice)\n";
 
   std::vector<size_t> sweep = {1, 2, 4, 6, 8, 12, 16, 24, 48, 96};
 
-  double base_ms = 0.0; // 1-thread wall time, for the speedup column
+  for(auto& c : cases) {
+    // Sequential baseline (also gives us the result and the decisive depth K*).
+    black::solver base;
+    tribool seq_res{tribool::undef};
+    double seq_ms = ms_of([&]{ seq_res = base.solve(xi, c.f); });
+    size_t kstar  = base.last_bound();
 
-  for(size_t T : sweep) {
-    black::solver s;
-    auto a = steady_clock::now();
-    tribool res = s.solve_parallel(xi, f, false, k_unbounded, {}, false, T);
-    auto b = steady_clock::now();
-    double ms = duration<double, std::milli>(b - a).count();
-    (void)res;
+    std::cout << "\n============================================================"
+                 "==================================\n";
+    std::cout << c.label << "   (" << show(seq_res) << ", K*=" << kstar
+              << ")   sequential = " << std::fixed
+              << [&]{ char b[32]; std::snprintf(b,sizeof(b),"%.1f",seq_ms); return std::string(b); }()
+              << " ms\n";
+    std::cout << std::string(108, '-') << "\n";
+    std::printf("%8s %11s %11s %13s %14s %12s %13s\n",
+                "threads", "naive_ms", "shared_ms", "naive_vs_seq",
+                "shared_vs_seq", "redundancy", "lock_waits");
+    std::cout << std::string(108, '-') << "\n";
 
-    auto c = s.last_parallel_counters();
-    if(T == 1) base_ms = ms;
+    for(size_t T : sweep) {
+      black::solver sn;
+      tribool rn{tribool::undef};
+      double naive_ms = ms_of([&]{
+        rn = sn.solve_parallel(xi, c.f, false, k_unbounded, {}, false, T);
+      });
+      auto cnt = sn.last_parallel_counters();
 
-    const char* over = (T > hw) ? " *" : "";
-    std::printf("%10zu %9.1f %13.2f %15zu %14zu %16zu %13zu %15zu %11.2fx%s\n",
-                T, ms, base_ms > 0 ? base_ms / ms : 0.0,
-                c.launched_threads, c.aborted_threads, c.lock_waits,
-                c.unravelings_needed, c.unravelings_computed,
-                c.redundancy, over);
+      black::solver ss;
+      tribool rs{tribool::undef};
+      double shared_ms = ms_of([&]{
+        rs = ss.solve_parallel_shared(xi, c.f, false, k_unbounded, {}, false, T, false);
+      });
+
+      bool mismatch = (rn != seq_res) || (rs != seq_res);
+      std::string note;
+      if(T > hw)   note += " *";
+      if(mismatch) note += " MISMATCH";
+
+      std::printf("%8zu %11.1f %11.1f %13.2f %14.2f %11.2fx %13zu%s\n",
+                  T, naive_ms, shared_ms,
+                  naive_ms  > 0 ? seq_ms / naive_ms  : 0.0,
+                  shared_ms > 0 ? seq_ms / shared_ms : 0.0,
+                  cnt.redundancy, cnt.lock_waits, note.c_str());
+    }
   }
 
-  std::cout << std::string(122, '-') << "\n";
-  std::cout << "speedup_vs_1 = 1-thread time / this run's time (>1 means faster"
-               " than one thread).\n"
-               "'*' after redundancy = oversubscribed (more software threads than"
-               " hardware threads).\n";
+  std::cout << "\nnaive_vs_seq / shared_vs_seq = sequential time / that solver's"
+               " time (>1 = faster than sequential).\n"
+               "'*' = oversubscribed (threads > hardware threads).  redundancy &"
+               " lock_waits are for the naive solver.\n";
   return 0;
 }
