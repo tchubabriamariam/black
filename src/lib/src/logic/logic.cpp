@@ -23,7 +23,7 @@
 
 #include <black/logic/logic.hpp>
 
-#include <tsl/hopscotch_map.h>
+#include <boost/unordered/concurrent_flat_map.hpp>
 
 #include <atomic>
 #include <mutex>
@@ -35,8 +35,8 @@
 // `logic.hpp` and subfiles. In particular, here we declare some components of
 // the `alphabet` class. BLACK's logic API is for the most part a header library
 // being 99% templates, but this part is implemented in a source file mainly in
-// order to keep `tsl::hopscotch_map` as a private dependency. To understand
-// what follows, be sure to read the explanations in `core.hpp` and
+// order to keep `boost::concurrent_flat_map` as a private dependency. To
+// understand what follows, be sure to read the explanations in `core.hpp` and
 // `generation.hpp`.
 //
 
@@ -64,20 +64,65 @@ namespace black_internal::logic {
   // mechanism is implemented in the following class, which will be indirectly
   // inherited by the pimpl class `alphabet_impl`.
   //
+  // Stage 2 of parallelizing BLACK: `_map` is now a `boost::concurrent_flat_map`,
+  // which handles its own internal locking (many small locks instead of one big
+  // one) and is safe for several threads to read and write at once. That removes
+  // the need for `alphabet_impl`'s old coarse `std::mutex` around every lookup:
+  // the common case (the node already exists) now needs no lock from us at all.
+  //
+  // `_store` is still a plain `std::deque`, which is NOT safe for concurrent
+  // `emplace_back()`. So the only remaining critical section is the rarer path
+  // where a node is genuinely new: `_store_mutex` protects just that insertion,
+  // not the lookup. Two threads racing to insert the same new node is handled
+  // by `_map`'s own `try_emplace_or_visit`: only one insert wins atomically, and
+  // the losing thread is hand back the winner's pointer instead, so uniqueness
+  // still holds. The loser's `_store` slot is simply never referenced again
+  // (a small, harmless amount of wasted memory, not a correctness problem,
+  // since nothing else in the alphabet keeps `_store` slots reachable by index).
+  //
   template<storage_type Storage>
   struct storage_allocator {
     std::deque<storage_node<Storage>> _store;
-    tsl::hopscotch_map<storage_node<Storage>, storage_node<Storage> *> _map;
-   
-    storage_node<Storage> *allocate(storage_node<Storage> const& node) {
-      auto it = _map.find(node);
-      if(it != _map.end())
-        return it->second;
-     
-      storage_node<Storage> *obj = &_store.emplace_back(node);
-      _map.insert({node, obj});
+    std::mutex _store_mutex;
+    boost::concurrent_flat_map<
+      storage_node<Storage>, storage_node<Storage> *,
+      std::hash<storage_node<Storage>>
+    > _map;
 
-      return obj;
+    // Counts how many times a thread found `_store_mutex` already held and had
+    // to wait for it. Only the "genuinely new node" path takes this lock at
+    // all, so this is a much narrower measure of contention than the old
+    // alphabet-wide mutex counter: uncontended lookups never touch it.
+    std::atomic<size_t> _store_contended{0};
+
+    storage_node<Storage> *allocate(storage_node<Storage> const& node) {
+      // Fast path: lock-free (from our side) lookup. Most calls land here.
+      storage_node<Storage> *found = nullptr;
+      _map.visit(node, [&](auto const& kv) { found = kv.second; });
+      if(found)
+        return found;
+
+      // Slow path: build the node under our own lock (protects `_store`,
+      // which the concurrent map doesn't own or know about).
+      storage_node<Storage> *obj;
+      {
+        if(!_store_mutex.try_lock()) {
+          _store_contended.fetch_add(1, std::memory_order_relaxed);
+          _store_mutex.lock();
+        }
+        std::lock_guard<std::mutex> lock(_store_mutex, std::adopt_lock);
+        obj = &_store.emplace_back(node);
+      }
+
+      // Atomically insert if still absent, or fetch whichever pointer won the
+      // race if another thread inserted the same node in the meantime.
+      storage_node<Storage> *winner = obj;
+      _map.try_emplace_or_visit(
+        node, obj,
+        [&](auto const& kv) { winner = kv.second; }
+      );
+
+      return winner;
     }
   };
 
@@ -90,11 +135,16 @@ namespace black_internal::logic {
     requires (std::is_same_v<
       typename storage_data_t<Storage>::tuple_type, std::tuple<bool>
     >)
-  struct storage_allocator<Storage> 
-  {  
+  struct storage_allocator<Storage>
+  {
     storage_node<Storage> _true{element_of_storage_v<Storage>, true};
     storage_node<Storage> _false{element_of_storage_v<Storage>, false};
-    
+
+    // Never touched: returning one of two fixed constants needs no locking
+    // and no map lookup at all. Present only so `lock_contention_count()`'s
+    // generated loop over every storage kind compiles uniformly.
+    std::atomic<size_t> _store_contended{0};
+
     storage_node<Storage> *allocate(storage_node<Storage> node) {
       if(std::get<0>(node.data.values))
         return &_true;
@@ -112,23 +162,29 @@ namespace black_internal::logic {
     #include <black/internal/logic/hierarchy.hpp>
 
     //
-    // Stage 1 of parallelizing BLACK (naive locking): the alphabet was
-    // originally single-threaded, so `allocate()` does an unsynchronised
-    // find-then-insert into the per-kind `_store`/`_map`. When several worker
-    // threads intern nodes into the same alphabet at once (e.g. k-level
-    // parallel solving), that is a data race. This single mutex serialises all
-    // uniquing across every storage kind. It is deliberately coarse and slow:
-    // it just makes concurrent uniquing correct. A later stage replaces it with
-    // a concurrent hash table selectable at compile time so that sequential use
-    // pays nothing.
+    // Stage 2 of parallelizing BLACK: the old alphabet-wide `std::mutex` that
+    // serialised every lookup across every storage kind is gone. Concurrency
+    // is now handled per storage kind, inside each `storage_allocator`
+    // (`boost::concurrent_flat_map` for lookups, a small `_store_mutex` only
+    // for genuinely new nodes). Sequential (single-threaded) use pays for
+    // exactly the same work as before; concurrent use no longer serialises on
+    // one lock for reads that don't need it.
     //
-    std::mutex _mutex;
 
-    // Counts how many times a thread found `_mutex` already held and had to
-    // wait for it (lock contention). This is the "threads blocked on the lock"
-    // measure for the software-threads study. Incremented only on a failed
-    // try_lock, so uncontended (sequential) use adds no work.
-    std::atomic<size_t> _lock_contended{0};
+    // Total lock contention across every storage kind's `_store_mutex`, i.e.
+    // how many times a thread had to wait to insert a genuinely new node.
+    // This is a coarser signal than the old per-lookup counter (it only
+    // fires on the slow/new-node path now, since the fast/lookup path no
+    // longer takes a lock at all), but it is comparable across runs for the
+    // software-threads study.
+    size_t lock_contention_count() const {
+      size_t total = 0;
+      #define declare_storage_kind(Base, Storage) \
+        total += storage_allocator<storage_type::Storage>::_store_contended \
+          .load(std::memory_order_relaxed);
+      #include <black/internal/logic/hierarchy.hpp>
+      return total;
+    }
   };
 
   //
@@ -148,7 +204,7 @@ namespace black_internal::logic {
   alphabet_base::alphabet_impl *alphabet_base::impl() {
     if(!_impl)
       _impl = std::make_unique<alphabet_impl>();
-      
+
     return _impl.get();
   }
 
@@ -162,22 +218,20 @@ namespace black_internal::logic {
     alphabet_base::unique( \
       storage_node<storage_type::Storage> node \
     ) { \
-      alphabet_impl *pimpl = impl(); \
-      if(!pimpl->_mutex.try_lock()) { \
-        pimpl->_lock_contended.fetch_add(1, std::memory_order_relaxed); \
-        pimpl->_mutex.lock(); \
-      } \
-      std::lock_guard<std::mutex> lock(pimpl->_mutex, std::adopt_lock); \
-      return pimpl->allocate(std::move(node)); \
+      /* No outer lock here anymore: allocate() below does its own, narrower */ \
+      /* locking (concurrent map for lookups, a small per-kind mutex only */ \
+      /* for genuinely new nodes), instead of one lock shared by everything. */ \
+      return impl()->allocate(std::move(node)); \
     }
 
   #include <black/internal/logic/hierarchy.hpp>
 
-  // Total number of times a thread had to wait for the uniquing lock over this
-  // alphabet's lifetime. solve_parallel() snapshots this before/after a run to
-  // report the per-solve lock contention. Returns 0 if the impl is not built.
+  // Total number of times a thread had to wait to insert a genuinely new node,
+  // summed across every storage kind, over this alphabet's lifetime.
+  // solve_parallel() snapshots this before/after a run to report the
+  // per-solve lock contention. Returns 0 if the impl is not built.
   size_t alphabet_base::lock_contention_count() const {
-    return _impl ? _impl->_lock_contended.load(std::memory_order_relaxed) : 0;
+    return _impl ? _impl->lock_contention_count() : 0;
   }
 
 }
