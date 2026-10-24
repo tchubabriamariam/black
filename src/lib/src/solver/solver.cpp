@@ -35,10 +35,17 @@
 #include <future>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
 #include <vector>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+
+#include <pthread.h>
 
 #if defined(__APPLE__)
   #include <pthread/qos.h>
@@ -62,6 +69,7 @@ namespace black_internal::solver
     std::atomic<bool> interrupt_flag = false;
     std::function<void(trace_t)> tracer = [](trace_t){};
     solver::parallel_counters last_counters;
+    solver::cube_counters last_cube_counters;
 
     void trace(size_t k);
     void trace(trace_t::type_t, scope const&, logic::formula);
@@ -82,6 +90,13 @@ namespace black_internal::solver
       scope const& xi, logic::formula f,
       bool finite, size_t k_max, std::optional<std::chrono::seconds> timeout,
       bool semi_decision, size_t num_threads, bool pin_performance_cores
+    );
+
+    tribool solve_cube_and_conquer(
+      scope const& xi, logic::formula f,
+      bool finite, size_t k_max, std::optional<std::chrono::seconds> timeout,
+      bool semi_decision, size_t num_threads, size_t cube_depth,
+      bool full_check_worker, bool pin_performance_cores
     );
 
     solver::parallelism_report analyze_parallelism(
@@ -126,6 +141,18 @@ namespace black_internal::solver
     );
   }
 
+  tribool solver::solve_cube_and_conquer(
+    scope const& xi, logic::formula f,
+    bool finite, size_t k_max, std::optional<std::chrono::seconds> timeout,
+    bool semi_decision, size_t num_threads, size_t cube_depth,
+    bool full_check_worker, bool pin_performance_cores
+  ) {
+    return _data->solve_cube_and_conquer(
+      xi, f, finite, k_max, timeout, semi_decision,
+      num_threads, cube_depth, full_check_worker, pin_performance_cores
+    );
+  }
+
   solver::parallelism_report solver::analyze_parallelism(
     scope const& xi, logic::formula f,
     bool finite, size_t k_max, bool semi_decision
@@ -155,6 +182,10 @@ namespace black_internal::solver
 
   solver::parallel_counters solver::last_parallel_counters() const {
     return _data->last_counters;
+  }
+
+  solver::cube_counters solver::last_cube_counters() const {
+    return _data->last_cube_counters;
   }
 
   void solver::set_sat_backend(std::string name) {
@@ -713,6 +744,437 @@ namespace black_internal::solver
     if(result == 0)
       return false;
 
+    return tribool::undef;
+  }
+
+  namespace {
+    //
+    // Fixed pool of worker threads that all execute the same job together.
+    // run() hands the job to every worker and blocks until all of them have
+    // finished it, so consecutive jobs are separated by a barrier. This keeps
+    // the threads (and the SAT solvers they own) alive across all the checks
+    // of a cube-and-conquer run instead of respawning them per check.
+    //
+    struct worker_pool {
+      // Secondary threads get a small default stack (512KB on macOS), and both
+      // the formula-to-backend translation and the backends themselves (e.g.
+      // Z3's model construction) recurse on deep formulas, so the workers are
+      // created with the stack size of a main thread.
+      static constexpr size_t stack_size = size_t(64) << 20;
+
+      std::vector<pthread_t> threads;
+      std::mutex mutex;
+      std::condition_variable job_cv;
+      std::condition_variable done_cv;
+      std::function<void(size_t)> job;
+      size_t generation = 0;
+      size_t pending = 0;
+      bool stop = false;
+
+      struct start_t {
+        worker_pool *pool;
+        size_t tid;
+      };
+
+      explicit worker_pool(size_t n) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, stack_size);
+        threads.resize(n);
+        for(size_t tid = 0; tid < n; ++tid) {
+          [[maybe_unused]] int err = pthread_create(&threads[tid], &attr, [](void *arg) -> void* {
+            std::unique_ptr<start_t> start{static_cast<start_t *>(arg)};
+            start->pool->loop(start->tid);
+            return nullptr;
+          }, new start_t{this, tid});
+          black_assert(err == 0);
+        }
+        pthread_attr_destroy(&attr);
+      }
+
+      ~worker_pool() {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          stop = true;
+        }
+        job_cv.notify_all();
+        for(auto t : threads)
+          pthread_join(t, nullptr);
+      }
+
+      void run(std::function<void(size_t)> j) {
+        std::unique_lock<std::mutex> lock(mutex);
+        job = std::move(j);
+        pending = threads.size();
+        ++generation;
+        job_cv.notify_all();
+        done_cv.wait(lock, [&] { return pending == 0; });
+      }
+
+      void loop(size_t tid) {
+        size_t seen = 0;
+        while(true) {
+          std::function<void(size_t)> j;
+          {
+            std::unique_lock<std::mutex> lock(mutex);
+            job_cv.wait(lock, [&] { return stop || generation != seen; });
+            if(stop)
+              return;
+            seen = generation;
+            j = job;
+          }
+          j(tid);
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            if(--pending == 0)
+              done_cv.notify_one();
+          }
+        }
+      }
+    };
+
+    //
+    // Chooses the split variables for cube-and-conquer.
+    //
+    // Real cube-and-conquer solvers pick split variables with a look-ahead
+    // solver. Running a look-ahead through the SAT backend would cost two SAT
+    // calls per candidate, so we use the cheap static proxy of the same idea:
+    // the variables that occur in the most places of the encoding asserted so
+    // far are the ones whose assignment simplifies the most constraints, so
+    // splitting on them gives the most constrained (and most balanced)
+    // sub-problems. Each newly asserted formula is scanned once; shared
+    // sub-formulas are visited only once. Variables asserted as top-level
+    // units are skipped, since one of their two cubes would be trivially UNSAT.
+    //
+    struct split_heuristic {
+      std::unordered_map<proposition, size_t> occurrences;
+      std::unordered_set<proposition> units;
+      std::unordered_set<logic::formula> visited;
+
+      void add(logic::formula f) {
+        mark_units(f);
+
+        std::vector<logic::formula> stack{f};
+        while(!stack.empty()) {
+          logic::formula g = stack.back();
+          stack.pop_back();
+          if(!visited.insert(g).second)
+            continue;
+
+          auto child = [&](logic::formula c) {
+            if(auto p = c.to<proposition>(); p)
+              ++occurrences[*p];
+            stack.push_back(c);
+          };
+
+          g.match(
+            [&](negation, auto arg) { child(arg); },
+            [&](conjunction c) {
+              for(logic::formula op : operands(c))
+                child(op);
+            },
+            [&](disjunction c) {
+              for(logic::formula op : operands(c))
+                child(op);
+            },
+            [&](implication, auto left, auto right) {
+              child(left);
+              child(right);
+            },
+            [&](iff, auto left, auto right) {
+              child(left);
+              child(right);
+            },
+            [](otherwise) { }
+          );
+        }
+      }
+
+      void mark_units(logic::formula f) {
+        f.match(
+          [&](proposition p) { units.insert(p); },
+          [&](negation, auto arg) {
+            if(auto p = arg.template to<proposition>(); p)
+              units.insert(*p);
+          },
+          [&](conjunction c) {
+            for(logic::formula op : operands(c))
+              mark_units(op);
+          },
+          [](otherwise) { }
+        );
+      }
+
+      // The (at most) d most frequently occurring non-unit variables.
+      std::vector<proposition> pick(size_t d) const {
+        std::vector<std::pair<size_t, proposition>> ranked;
+        ranked.reserve(occurrences.size());
+        for(auto [p, n] : occurrences)
+          if(!units.contains(p))
+            ranked.push_back({n, p});
+
+        d = std::min(d, ranked.size());
+        std::partial_sort(
+          ranked.begin(), ranked.begin() + long(d), ranked.end(),
+          [](auto const& a, auto const& b) {
+            if(a.first != b.first)
+              return a.first > b.first;
+            return a.second.unique_id() < b.second.unique_id();
+          }
+        );
+
+        std::vector<proposition> result;
+        for(size_t i = 0; i < d; ++i)
+          result.push_back(ranked[i].second);
+        return result;
+      }
+    };
+
+    // All 2^d cubes over the given split variables: cube i sets variable j to
+    // true iff bit j of i is set. Together they partition the search space.
+    // With no split variables there is a single, empty cube (no assumption).
+    std::vector<std::optional<logic::formula>>
+    make_cubes(std::vector<proposition> const& vars) {
+      std::vector<std::optional<logic::formula>> cubes;
+      size_t n = size_t(1) << vars.size();
+      cubes.reserve(n);
+      for(size_t i = 0; i < n; ++i) {
+        std::optional<logic::formula> cube;
+        for(size_t j = 0; j < vars.size(); ++j) {
+          logic::formula lit = vars[j];
+          if(!(i & (size_t(1) << j)))
+            lit = !vars[j];
+          cube = cube ? logic::formula{*cube && lit} : lit;
+        }
+        cubes.push_back(cube);
+      }
+      return cubes;
+    }
+  } // anonymous namespace
+
+  /*
+   * Cube-and-conquer algorithm.
+   *
+   * The k-loop is the sequential one: unravel, check, check EMPTY/LOOP, prune,
+   * check. What changes is how each of those SAT checks is answered.
+   *
+   * Cube phase (coordinator thread): it alone owns the encoder and so is the
+   * only thread that creates formulas. Before every check it picks d split
+   * variables (split_heuristic) and builds the 2^d cubes over them.
+   *
+   * Conquer phase (worker pool): each worker owns an independent SAT solver
+   * that holds the same cumulative encoding (the coordinator hands every new
+   * formula to all workers, which assert it into their own solver). The
+   * workers then pull cube indices from a shared atomic counter, so a worker
+   * that finishes an easy cube immediately takes the next one, and solve
+   * `is_sat_with(cube [&& EMPTY||LOOP])`. The check is SAT as soon as one cube
+   * is SAT, and UNSAT once every cube has been refuted; once it is settled no
+   * further cubes are started. Optionally worker 0 races the cubes by
+   * solving the whole, unsplit check (see conquer below).
+   *
+   * When the EMPTY/LOOP check is SAT, the solver of the worker that found the
+   * model holds a model of the whole encoding, so it becomes this solver's
+   * `sat` and model extraction works exactly as after solve().
+   */
+  tribool solver::_solver_t::solve_cube_and_conquer(
+    scope const& s, logic::formula f, bool finite,
+    size_t k_max, std::optional<std::chrono::seconds> timeout,
+    bool semi_decision, size_t num_threads, size_t cube_depth,
+    bool full_check_worker, bool pin_performance_cores
+  ) {
+    using clock = std::chrono::steady_clock;
+    auto ms = [](clock::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
+
+    if(num_threads == 0)
+      num_threads = 1;
+    if(cube_depth == 0) {
+      // smallest d with 2^d >= 4 * num_threads
+      while((size_t(1) << cube_depth) < 4 * num_threads)
+        ++cube_depth;
+    }
+
+    last_cube_counters = {};
+    last_cube_counters.threads = num_threads;
+    last_cube_counters.cube_depth = cube_depth;
+    auto &counters = last_cube_counters;
+
+    scope xi = chain(s);
+    enc = encoder::encoder{f, xi, finite};
+    trace(trace_t::nnf, xi, enc->get_formula());
+    sigma = f.sigma();
+    sat.reset();
+    model = false;
+    model_size = 0;
+    last_bound = 0;
+
+    // Each worker's scope is built here, on the coordinator, so the parent
+    // scope is never touched concurrently.
+    std::vector<scope> worker_scopes;
+    worker_scopes.reserve(num_threads);
+    for(size_t i = 0; i < num_threads; ++i)
+      worker_scopes.push_back(chain(s));
+
+    std::vector<std::unique_ptr<black::sat::solver>> sats(num_threads);
+    split_heuristic heuristic;
+
+    if(timeout)
+      std::thread([timeout, self = this->shared_from_this()]() {
+        std::this_thread::sleep_for(*timeout);
+        self->interrupt();
+      }).detach();
+
+    worker_pool pool{num_threads};
+    pool.run([&](size_t tid) {
+      if(pin_performance_cores)
+        request_performance_core();
+      sats[tid] =
+        black::sat::solver::get_solver(sat_backend, worker_scopes[tid]);
+    });
+
+    // Formulas built since the last check; every worker asserts them into its
+    // own solver at the start of the next conquer phase.
+    std::vector<logic::formula> to_assert;
+    auto assert_formula = [&](logic::formula g) {
+      heuristic.add(g);
+      to_assert.push_back(g);
+    };
+
+    // One cubed SAT check. `extra`, if given, is conjoined to every cube (it
+    // plays the role of the assumption of is_sat_with()). Returns true if the
+    // check is SAT (the worker holding the model in `winner`), false if it is
+    // UNSAT, and undef if that could not be established (interrupt/unknown).
+    //
+    // With full_check_worker (and more than one worker), worker 0 does not
+    // take cubes: it solves the whole check, as solve() would, racing the
+    // other workers that split it. This is the "concurrent cube-and-conquer"
+    // remedy for checks too easy to be worth splitting: the whole-check worker
+    // settles them about as fast as the sequential solver, while on hard
+    // checks the cubes win.
+    size_t winner = 0;
+    auto conquer = [&](std::optional<logic::formula> extra) -> tribool {
+      auto t0 = clock::now();
+      std::vector<std::optional<logic::formula>> cubes =
+        make_cubes(heuristic.pick(cube_depth));
+      if(extra)
+        for(auto &c : cubes)
+          c = c ? logic::formula{*c && *extra} : *extra;
+      counters.encode_ms += ms(clock::now() - t0);
+      ++counters.checks;
+      counters.cubes_generated += cubes.size();
+
+      std::vector<logic::formula> asserting = std::move(to_assert);
+      to_assert.clear();
+
+      bool racing = full_check_worker && num_threads > 1;
+
+      // -1 = undecided, 0 = UNSAT, 1 = SAT
+      std::atomic<int> decided{-1};
+      std::atomic<size_t> next{0};
+      std::atomic<size_t> unsat{0};
+      std::atomic<size_t> solved{0};
+
+      // The first worker to settle the check records the answer; the others
+      // take no new cubes and finish only the one they are solving. They are
+      // deliberately NOT stopped with the backend's interrupt(): a Z3 solver
+      // interrupted mid-check and then reused incrementally was observed to
+      // give wrong answers on later checks.
+      auto decide = [&](size_t tid, int result) {
+        int expected = -1;
+        if(decided.compare_exchange_strong(expected, result))
+          winner = tid;
+      };
+
+      t0 = clock::now();
+
+      pool.run([&](size_t tid) {
+        auto &local = sats[tid];
+        for(auto g : asserting)
+          local->assert_formula(g);
+
+        if(racing && tid == 0) {
+          if(decided != -1 || interrupt_flag)
+            return;
+          tribool res = extra ? local->is_sat_with(*extra) : local->is_sat();
+          if(res == true)
+            decide(tid, 1);
+          else if(res == false)
+            decide(tid, 0);
+          return;
+        }
+
+        while(decided == -1 && !interrupt_flag) {
+          size_t i = next.fetch_add(1);
+          if(i >= cubes.size())
+            break;
+
+          tribool res =
+            cubes[i] ? local->is_sat_with(*cubes[i]) : local->is_sat();
+          if(res == true) {
+            ++solved;
+            decide(tid, 1);
+            break;
+          }
+          if(res == false) {
+            ++solved;
+            if(++unsat == cubes.size())
+              decide(tid, 0);
+          }
+        }
+      });
+      counters.conquer_ms += ms(clock::now() - t0);
+
+      counters.cubes_unsat += unsat;
+      counters.cubes_skipped += cubes.size() - solved;
+      if(decided == -1)
+        return tribool::undef;
+      if(racing && winner == 0)
+        ++counters.full_check_wins;
+      else if(decided == 1)
+        ++counters.cubes_sat;
+      return decided == 1;
+    };
+
+    auto timed = [&](auto build) {
+      auto t0 = clock::now();
+      auto g = build();
+      counters.encode_ms += ms(clock::now() - t0);
+      return g;
+    };
+
+    for(size_t k = 0; !interrupt_flag && k <= k_max; last_bound = k++) {
+      trace(k);
+
+      auto unrav = timed([&] { return enc->k_unraveling(k); });
+      trace(trace_t::unrav, xi, unrav);
+      assert_formula(unrav);
+      if(tribool res = conquer({}); !res)
+        return res;
+
+      auto empty_or_loop = timed([&] {
+        auto empty = enc->k_empty(k);
+        auto loop  = enc->k_loop(k);
+        trace(trace_t::empty, xi, empty);
+        trace(trace_t::loop,  xi, loop);
+        return logic::formula{empty || loop};
+      });
+      if(conquer(empty_or_loop) == true) {
+        sat = std::move(sats[winner]);
+        model_size = k + 1;
+        model = true;
+        return true;
+      }
+
+      if(!semi_decision) {
+        auto prune = timed([&] { return enc->prune(k); });
+        trace(trace_t::prune, xi, prune);
+        assert_formula(!prune);
+        if(tribool res = conquer({}); !res)
+          return res;
+      }
+    }
+    interrupt_flag = false;
     return tribool::undef;
   }
 

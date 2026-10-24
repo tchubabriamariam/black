@@ -83,6 +83,7 @@ namespace black_internal::z3
     Z3_ast to_z3_inner(term);
 
     void upgrade_solver();
+    tribool check_result(Z3_lbool res);
   };
 
 
@@ -172,32 +173,40 @@ namespace black_internal::z3
     Z3_lbool res = 
       Z3_solver_check_assumptions(_data->context, _data->solver, 1, &asmptn);
 
-    if(res == Z3_L_TRUE) {
-      if(_data->model)
-        Z3_model_dec_ref(_data->context, *_data->model);
-      
-      _data->model = Z3_solver_get_model(_data->context, _data->solver);
-    }
-
-    return res == Z3_L_TRUE ? tribool{true} :
-           res == Z3_L_FALSE ? tribool{false} :
-           tribool::undef;
+    return _data->check_result(res);
   }
 
   tribool z3::is_sat() {
     Z3_lbool res = Z3_solver_check(_data->context, _data->solver);
 
-    if(res == Z3_L_TRUE) {
-      if(_data->model)
-        Z3_model_dec_ref(_data->context, *_data->model);
-      
-      _data->model = Z3_solver_get_model(_data->context, _data->solver);
-      Z3_model_inc_ref(_data->context, *_data->model);
-    }
+    return _data->check_result(res);
+  }
 
-    return res == Z3_L_TRUE ? tribool{true} :
-           res == Z3_L_FALSE ? tribool{false} :
-           tribool::undef;
+  static void ignore_error(Z3_context, Z3_error_code) { }
+
+  // Stores the model after a satisfiable check. An interrupt() landing just
+  // as the check returns can leave no model behind (Z3 then reports "there
+  // is no current model"), in which case the result is reported as unknown.
+  tribool z3::_z3_t::check_result(Z3_lbool res) {
+    if(res == Z3_L_FALSE)
+      return false;
+    if(res != Z3_L_TRUE)
+      return tribool::undef;
+
+    if(model)
+      Z3_model_dec_ref(context, *model);
+    model.reset();
+
+    Z3_set_error_handler(context, ignore_error);
+    Z3_model m = Z3_solver_get_model(context, solver);
+    Z3_set_error_handler(context, error_handler);
+
+    if(!m)
+      return tribool::undef;
+
+    Z3_model_inc_ref(context, m);
+    model = m;
+    return true;
   }
 
   tribool z3::value(proposition a) const {

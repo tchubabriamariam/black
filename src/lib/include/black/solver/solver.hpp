@@ -104,6 +104,56 @@ namespace black_internal::solver {
         bool pin_performance_cores = false
       );
 
+      // Cube-and-conquer version of solve().
+      //
+      // Instead of racing on different k (as the two variants above do), this
+      // parallelises INSIDE each SAT check. The k-loop runs in order exactly
+      // like solve(), but every one of its SAT checks is split into 2^d
+      // "cubes": d split variables are chosen from the encoding built so far,
+      // and each cube fixes them to one of the 2^d possible assignments. The
+      // cubes partition the search space, so the check is SAT iff some cube is
+      // SAT and UNSAT iff every cube is UNSAT. A pool of num_threads workers,
+      // each owning its own SAT solver holding the same cumulative encoding,
+      // pulls cubes from a shared queue and solves them under assumptions.
+      // Once a check is settled no further cubes are started.
+      //
+      // cube_depth = d. With 0 it is chosen automatically from num_threads
+      // (enough cubes for roughly four per worker, for load balancing).
+      //
+      // If full_check_worker is true, worker 0 takes no cubes and instead
+      // solves each check whole, racing the other workers (concurrent
+      // cube-and-conquer): easy checks are then settled about as fast as by
+      // solve(), and only hard ones benefit from the split.
+      tribool solve_cube_and_conquer(
+        scope const& xi,
+        formula f,
+        bool finite = false,
+        size_t k_max = std::numeric_limits<size_t>::max(),
+        std::optional<std::chrono::seconds> timeout = {},
+        bool semi_decision = false,
+        size_t num_threads = 4,
+        size_t cube_depth = 0,
+        bool full_check_worker = true,
+        bool pin_performance_cores = false
+      );
+
+      // Instrumentation recorded by the most recent solve_cube_and_conquer().
+      struct cube_counters {
+        size_t threads         = 0; // worker threads used
+        size_t cube_depth      = 0; // d: split variables per check (max)
+        size_t checks          = 0; // SAT checks performed (each one cubed)
+        size_t cubes_generated = 0; // cubes produced over all checks
+        size_t cubes_sat       = 0; // cubes found SAT
+        size_t cubes_unsat     = 0; // cubes refuted
+        size_t cubes_skipped   = 0; // cubes never finished: check already settled
+        size_t full_check_wins = 0; // checks settled by the whole-check worker
+        double encode_ms       = 0.0; // building formulas + choosing cubes
+        double conquer_ms      = 0.0; // workers asserting + solving cubes
+      };
+
+      // Counters from the last solve_cube_and_conquer() call.
+      cube_counters last_cube_counters() const;
+
       // Instrumentation recorded by the most recent solve_parallel() call, for
       // the software-threads study: how the software threads behaved and how
       // much redundant work they performed relative to what was actually needed.
